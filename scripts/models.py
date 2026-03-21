@@ -329,6 +329,8 @@ class AuditReport:
                 return [_convert(i) for i in obj]
             if isinstance(obj, tuple) and not isinstance(obj, ElementType):
                 return list(obj)
+            if isinstance(obj, Enum):
+                return obj.value
             return obj
 
         out = _convert(self)
