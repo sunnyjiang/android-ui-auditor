@@ -1,0 +1,8 @@
+.DS_Store
+.superpowers/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
