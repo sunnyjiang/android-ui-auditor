@@ -53,10 +53,10 @@
 
 | Layer | Technology | Role |
 |-------|-----------|------|
-| Image Processing | OpenCV + Ultralytics (YOLO) | Zone segmentation, element detection |
+| Image Processing | OpenCV | Zone segmentation, element detection |
 | Vision Analysis | Anthropic Claude API (Vision) | Per-element property extraction |
 | Core Logic | Python 3.9+, pandas, pydantic | Data modeling, scoring engine |
-| Report | JSON + HTML visualization | Structured output + interactive report |
+| Report | JSON + Plotly.js (CDN) | Structured output + interactive HTML report |
 
 ---
 
@@ -201,7 +201,7 @@ Each category is scored 0–100. Scores are computed from element-level property
   "issue": "文字与背景对比度不足，当前为 3.2:1，低于 WCAG AA 要求的 4.5:1",
   "suggestion": "将文字颜色从 #757575 调整为 #616161 或更深色",
   "affected_elements": ["wifi_item", "mobile_network_item"],
-  "expected_score_gain": 8
+  "expected_score_gain": 8  // subjective estimate by evaluator (0–20 range)
 }
 ```
 
