@@ -20,6 +20,7 @@ import base64
 import json
 import os
 import time
+import requests
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
@@ -29,12 +30,19 @@ from PIL import Image
 
 from models import ElementAnalysis, ElementBox, ElementProperties, ZoneDetectionResult
 
+# Try importing openai for MiniMax native endpoint
+try:
+    import openai as _openai
+    _HAS_OPENAI = True
+except ImportError:
+    _HAS_OPENAI = False
+
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-_ANTHROPIC_MODEL = "claude-3-5-sonnet-latest"
+_ANTHROPIC_MODEL = "abab6.5s-chat"  # MiniMax vision-capable model
 _MAX_IMAGE_SIZE = (1024, 1024)      # Claude Vision max input
 _MAX_PIXELS = 5 * 1024 * 1024      # 5M pixels — Claude limit
 _MAX_BATCH = 8                       # elements per API call
@@ -112,18 +120,41 @@ class VisionClient:
         api_key : str, optional
             Anthropic API key. Falls back to ANTHROPIC_API_KEY env var.
         model : str
-            Claude model to use. Default: claude-3-5-sonnet-latest
+            Claude model to use. Default: MiniMax-M2.7
         max_batch : int
             Max elements to send per API call.
         """
-        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        # Determine API key: prefer MINIMAX_API_KEY for MiniMax, then ANTHROPIC_API_KEY
+        self.api_key = (
+            api_key
+            or os.environ.get("MINIMAX_API_KEY")
+            or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+            or os.environ.get("ANTHROPIC_API_KEY")
+        )
         if not self.api_key:
             raise ValueError(
-                "ANTHROPIC_API_KEY not set. Pass api_key or set the env var."
+                "No API key found. Set MINIMAX_API_KEY, ANTHROPIC_AUTH_TOKEN, "
+                "or ANTHROPIC_API_KEY env var."
             )
         self.model = model
         self.max_batch = max_batch
-        self._client = anthropic.Anthropic(api_key=self.api_key)
+
+        # Detect MiniMax vs Anthropic based on base URL env var
+        base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
+        self._use_minimax = "minimax" in base_url.lower()
+
+        if self._use_minimax:
+            # MiniMax native endpoint (OpenAI-compatible)
+            self._base_url = base_url.rstrip("/")
+            # If base_url still points to /anthropic, switch to /v1
+            if "/anthropic" in self._base_url:
+                self._base_url = self._base_url.replace("/anthropic", "/v1")
+            self._endpoint = f"{self._base_url}/chat/completions"
+        else:
+            # Anthropic official endpoint
+            self._client = anthropic.Anthropic(api_key=self.api_key)
+            self._endpoint = None
+
         self._cache: dict[str, ElementAnalysis] = {}
 
     # ------------------------------------------------------------------
@@ -168,7 +199,14 @@ class VisionClient:
                     )
                     results.extend(batch_results)
                     break
-                except (anthropic.RateLimitError, anthropic.APIError) as exc:
+                except Exception as exc:
+                    # Rate limit check for both Anthropic SDK errors and MiniMax HTTP errors
+                    is_rate_limit = isinstance(exc, (anthropic.RateLimitError, anthropic.APIError))
+                    if not is_rate_limit and hasattr(exc, "response") and exc.response is not None:
+                        is_rate_limit = (exc.response.status_code == 429)
+                    if not is_rate_limit:
+                        raise  # re-raise immediately
+                    # is_rate_limit: fall through to retry
                     retry_count += 1
                     if retry_count >= _MAX_RETRIES:
                         raise
@@ -210,10 +248,10 @@ class VisionClient:
         img_h: int,
     ) -> list[ElementAnalysis]:
         """
-        Send a batch of elements to Claude Vision and parse the response.
+        Send a batch of elements to the vision API and parse the response.
+        Handles both MiniMax (OpenAI-style) and Anthropic (native) formats.
         """
-        # Build a simple annotated image: draw crop markers for each element region
-        # We include the full image and describe each bounding box in the prompt.
+        # Build element descriptions for the prompt
         box_descriptions = []
         for box in boxes:
             box_descriptions.append(
@@ -230,38 +268,76 @@ class VisionClient:
             + "If you cannot determine a property, use null or a sensible default."
         )
 
-        response = self._client.messages.create(
-            model=self.model,
-            max_tokens=4096,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/png",
-                                "data": image_b64,
+        if self._use_minimax:
+            # MiniMax native endpoint: OpenAI-style chat completions with image_url
+            payload = {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{image_b64}"},
                             },
-                        },
-                        {"type": "text", "text": prompt},
-                    ],
-                }
-            ],
-        )
-
-        # Parse response — filter out thinking blocks, keep text blocks
-        text_blocks = [
-            b for b in response.content
-            if hasattr(b, 'type') and b.type == 'text'
-        ]
-        if not text_blocks:
-            raise ValueError(
-                f"No text block in Claude response. Content types: "
-                f"{[getattr(b, 'type', '?') for b in response.content]}"
+                            {"type": "text", "text": prompt},
+                        ],
+                    }
+                ],
+                "max_tokens": 4096,
+            }
+            resp = requests.post(
+                self._endpoint,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=60,
             )
-        response_text = text_blocks[0].text
+            if resp.status_code != 200:
+                raise ValueError(f"MiniMax API error {resp.status_code}: {resp.text[:500]}")
+            resp_data = resp.json()
+            response_text = (
+                resp_data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+        else:
+            # Anthropic native endpoint
+            response = self._client.messages.create(
+                model=self.model,
+                max_tokens=4096,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": image_b64,
+                                },
+                            },
+                            {"type": "text", "text": prompt},
+                        ],
+                    }
+                ],
+            )
+            # Parse response — filter out thinking blocks, keep text blocks
+            text_blocks = [
+                b for b in response.content
+                if hasattr(b, 'type') and b.type == 'text'
+            ]
+            if not text_blocks:
+                raise ValueError(
+                    f"No text block in Claude response. Content types: "
+                    f"{[getattr(b, 'type', '?') for b in response.content]}"
+                )
+            response_text = text_blocks[0].text
+
+        # Parse JSON from response text
         try:
             data = json.loads(response_text)
         except json.JSONDecodeError:
@@ -276,7 +352,7 @@ class VisionClient:
                 if match:
                     data = json.loads(match.group(0))
                 else:
-                    raise ValueError(f"Could not parse JSON from Claude response:\n{response_text[:500]}")
+                    raise ValueError(f"Could not parse JSON from API response:\n{response_text[:500]}")
 
         elements_map = data.get("elements", {})
 

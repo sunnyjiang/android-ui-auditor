@@ -21,6 +21,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from PIL import Image
+
 from models import AuditReport, CategoryScore, ImprovementItem
 
 
@@ -56,13 +58,23 @@ def generate_report(
     json_path = out_path / "audit_report.json"
     html_path = out_path / "audit_report.html"
 
+    # Crop element images from the screenshot
+    element_images: dict[str, str] = {}
+    screenshot_path = report.screenshot_path
+    if os.path.exists(screenshot_path):
+        element_images = _crop_element_images(
+            screenshot_path,
+            report.zone_detection.element_boxes,
+            out_path,
+        )
+
     # Write JSON
     json_data = report.to_dict()
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(json_data, f, indent=2, ensure_ascii=False)
 
     # Write HTML
-    html_content = _build_html_report(report)
+    html_content = _build_html_report(report, element_images)
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html_content)
 
@@ -73,7 +85,52 @@ def generate_report(
 # HTML report builder
 # ---------------------------------------------------------------------------
 
-def _build_html_report(report: AuditReport) -> str:
+def _crop_element_images(
+    screenshot_path: str,
+    element_boxes: list,
+    out_dir: Path,
+) -> dict[str, str]:
+    """
+    Crop each element's bounding box from the screenshot and save as PNG.
+    Returns a dict mapping element_id -> relative path to cropped image.
+    """
+    images: dict[str, str] = {}
+    try:
+        img = Image.open(screenshot_path).convert("RGB")
+        img_w, img_h = img.size
+        crops_dir = out_dir / "element_crops"
+        crops_dir.mkdir(exist_ok=True)
+
+        for box in element_boxes:
+            # Add 5px padding around the element for context
+            pad = 5
+            x1 = max(0, box.x - pad)
+            y1 = max(0, box.y - pad)
+            x2 = min(img_w, box.x + box.w + pad)
+            y2 = min(img_h, box.y + box.h + pad)
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            crop = img.crop((x1, y1, x2, y2))
+            filename = f"{box.element_id}.png"
+            crop_path = crops_dir / filename
+            crop.save(crop_path, "PNG")
+            # Store relative path from output directory
+            rel_path = str(crop_path.relative_to(out_dir))
+            images[box.element_id] = rel_path
+
+    except Exception as e:
+        print(f"[report_generator] Warning: could not crop elements: {e}")
+
+    return images
+
+
+def _build_html_report(
+    report: AuditReport,
+    element_images: Optional[dict[str, str]] = None,
+    report_out_dir: Optional[str] = None,
+) -> str:
     """Build a complete standalone HTML report with Plotly.js from CDN."""
 
     # Score color
@@ -126,9 +183,6 @@ def _build_html_report(report: AuditReport) -> str:
     else:
         improvements_html = '<div style="color:#22c55e;font-size:16px;padding:16px;">✓ All dimensions score 70 or above — no critical improvements needed!</div>'
 
-    # Grid heatmap HTML
-    heatmap_html = _build_heatmap_html(report)
-
     # Zone comparison HTML
     zone_html = ""
     if report.zone_comparison.functional_zones:
@@ -141,11 +195,23 @@ def _build_html_report(report: AuditReport) -> str:
           <div style="color:#e2e8f0;">Visual Weight: <strong>{zc.visual_weight:.2f}</strong></div>
         </div>"""
 
-    # Element inspector HTML (list of elements with properties)
+    # Element inspector HTML (list of elements with properties and cropped images)
     elements_html = ""
     if report.element_analysis:
         for ea in report.element_analysis[:50]:  # limit to 50 for readability
             p = ea.properties
+            # Show cropped element image if available
+            crop_src = ""
+            if element_images and ea.element_id in element_images:
+                crop_rel = element_images[ea.element_id]
+                crop_src = (
+                    f'<div style="margin-bottom:8px;">'
+                    f'<img src="{crop_rel}" alt="{ea.element_id}" '
+                    f'style="max-width:100%;max-height:80px;border-radius:4px;border:1px solid #333;display:block;" '
+                    f'onerror="this.style.display=\'none\'">'
+                    f'</div>'
+                )
+
             elements_html += f"""
         <div style="margin-bottom:12px;padding:10px;background:#1e1e32;border-radius:6px;cursor:pointer;"
              onclick="this.classList.toggle('expanded')">
@@ -153,15 +219,18 @@ def _build_html_report(report: AuditReport) -> str:
             <span>{ea.element_id}</span>
             <span style="color:#94a3b8;font-weight:normal;">{p.element_type}</span>
           </div>
-          <div class="element-details" style="display:none;margin-top:8px;font-size:13px;color:#94a3b8;grid-template-columns:1fr 1fr;gap:4px;">
-            <div>BG: <span style="color:#e2e8f0;">{p.background_hex}</span></div>
-            <div>FG: <span style="color:#e2e8f0;">{p.foreground_hex}</span></div>
-            <div>Font: <span style="color:#e2e8f0;">{p.font_family}</span></div>
-            <div>Size: <span style="color:#e2e8f0;">{p.font_size_sp}sp</span></div>
-            <div>Contrast: <span style="color:#e2e8f0;">{p.contrast_ratio:.1f}</span> ({p.wcag_level or 'N/A'})</div>
-            <div>Touch: <span style="color:#e2e8f0;">{p.touch_target_dp}dp</span></div>
-            <div>Padding: <span style="color:#e2e8f0;">{p.padding_top:.0f},{p.padding_right:.0f},{p.padding_bottom:.0f},{p.padding_left:.0f}</span></div>
-            <div>Radius: <span style="color:#e2e8f0;">{p.border_radius_dp}dp</span></div>
+          <div class="element-details" style="display:none;margin-top:8px;">
+            {crop_src}
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:13px;color:#94a3b8;">
+              <div>BG: <span style="color:#e2e8f0;">{p.background_hex}</span></div>
+              <div>FG: <span style="color:#e2e8f0;">{p.foreground_hex}</span></div>
+              <div>Font: <span style="color:#e2e8f0;">{p.font_family}</span></div>
+              <div>Size: <span style="color:#e2e8f0;">{p.font_size_sp}sp</span></div>
+              <div>Contrast: <span style="color:#e2e8f0;">{p.contrast_ratio:.1f}</span> ({p.wcag_level or 'N/A'})</div>
+              <div>Touch: <span style="color:#e2e8f0;">{p.touch_target_dp}dp</span></div>
+              <div>Padding: <span style="color:#e2e8f0;">{p.padding_top:.0f},{p.padding_right:.0f},{p.padding_bottom:.0f},{p.padding_left:.0f}</span></div>
+              <div>Radius: <span style="color:#e2e8f0;">{p.border_radius_dp}dp</span></div>
+            </div>
           </div>
         </div>"""
 

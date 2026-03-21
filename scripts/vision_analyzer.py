@@ -72,7 +72,7 @@ class VisionAndroidUIAuditor:
     def __init__(
         self,
         anthropic_api_key: Optional[str] = None,
-        claude_model: str = "claude-3-5-sonnet-latest",
+        claude_model: str = "MiniMax-M2.7",
         grid_size: tuple[int, int] = (3, 4),
         brand_guidelines: Optional[dict] = None,
     ):
@@ -82,7 +82,7 @@ class VisionAndroidUIAuditor:
         anthropic_api_key : str, optional
             Anthropic API key. Falls back to ANTHROPIC_API_KEY env var.
         claude_model : str
-            Claude model for vision analysis. Default: claude-3-5-sonnet-latest
+            Claude model for vision analysis. Default: MiniMax-M2.7
         grid_size : tuple[int, int]
             (rows, cols) for grid overlay. Default: (3, 4)
         brand_guidelines : dict, optional
@@ -305,8 +305,8 @@ Examples:
     )
     parser.add_argument(
         "--model",
-        default="claude-3-5-sonnet-latest",
-        help="Claude model (default: claude-3-5-sonnet-latest)",
+        default="MiniMax-M2.7",
+        help="Claude model (default: MiniMax-M2.7)",
     )
     parser.add_argument(
         "--grid",
