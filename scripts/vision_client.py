@@ -306,7 +306,7 @@ class VisionClient:
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
                 },
-                timeout=60,
+                timeout=180,
             )
             if resp.status_code != 200:
                 raise ValueError(f"MiniMax API error {resp.status_code}: {resp.text[:500]}")
