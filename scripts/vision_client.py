@@ -45,9 +45,9 @@ except ImportError:
 _ANTHROPIC_MODEL = "abab6.5s-chat"  # MiniMax vision-capable model
 _MAX_IMAGE_SIZE = (1024, 1024)      # Claude Vision max input
 _MAX_PIXELS = 5 * 1024 * 1024      # 5M pixels — Claude limit
-_MAX_BATCH = 8                       # elements per API call
-_MAX_RETRIES = 3
-_RETRY_DELAY = 5                     # seconds
+_MAX_BATCH = 3                       # elements per API call
+_MAX_RETRIES = 5
+_RETRY_DELAY = 10                     # seconds
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +191,9 @@ class VisionClient:
 
         for i in range(0, len(boxes), self.max_batch):
             batch = boxes[i : i + self.max_batch]
+            batch_num = i // self.max_batch + 1
+            total_batches = (len(boxes) + self.max_batch - 1) // self.max_batch
+            print(f"[vision_client] Batch {batch_num}/{total_batches}: elements {i}-{i+len(batch)-1}")
             retry_count = 0
             while retry_count < _MAX_RETRIES:
                 try:
@@ -200,19 +203,29 @@ class VisionClient:
                     results.extend(batch_results)
                     break
                 except Exception as exc:
-                    # Rate limit check for both Anthropic SDK errors and MiniMax HTTP errors
+                    # Check if this is a retriable error
                     is_rate_limit = isinstance(exc, (anthropic.RateLimitError, anthropic.APIError))
-                    if not is_rate_limit and hasattr(exc, "response") and exc.response is not None:
-                        is_rate_limit = (exc.response.status_code == 429)
-                    if not is_rate_limit:
+                    is_minimax_retryable = False
+                    if hasattr(exc, "response") and exc.response is not None:
+                        is_minimax_retryable = exc.response.status_code in (429, 404)
+                    elif isinstance(exc, ValueError) and "MiniMax API error" in str(exc):
+                        # ValueError from our own HTTP status check — extract status
+                        import re
+                        m = re.search(r"error (\d+):", str(exc))
+                        if m and int(m.group(1)) in (429, 404):
+                            is_minimax_retryable = True
+                    is_retriable = is_rate_limit or is_minimax_retryable
+                    if not is_retriable:
                         raise  # re-raise immediately
-                    # is_rate_limit: fall through to retry
                     retry_count += 1
                     if retry_count >= _MAX_RETRIES:
                         raise
                     wait = _RETRY_DELAY * retry_count
                     print(f"[vision_client] Retry {retry_count}/{_MAX_RETRIES} after {wait}s: {exc}")
                     time.sleep(wait)
+            # Sleep between batches to avoid rate limiting
+            if i + self.max_batch < len(boxes):
+                time.sleep(5)
 
         return results
 
@@ -343,16 +356,31 @@ class VisionClient:
         except json.JSONDecodeError:
             # Try to extract JSON from markdown code blocks
             import re
-            match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", response_text, re.DOTALL)
-            if match:
-                data = json.loads(match.group(1))
-            else:
-                # Try to find raw JSON object
-                match = re.search(r"\{[\s\S]*\}", response_text)
+
+            def _extract_json(text):
+                """Extract JSON object from text, handling markdown code fences."""
+                # Try markdown code fence first: ```json\n{...}```
+                match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text)
                 if match:
-                    data = json.loads(match.group(0))
-                else:
-                    raise ValueError(f"Could not parse JSON from API response:\n{response_text[:500]}")
+                    return match.group(1)
+                # Try raw JSON object with balanced braces
+                # Find first '{' and last '}'
+                first_brace = text.find('{')
+                last_brace = text.rfind('}')
+                if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                    candidate = text[first_brace:last_brace + 1]
+                    try:
+                        json.loads(candidate)
+                        return candidate
+                    except json.JSONDecodeError:
+                        pass
+                return None
+
+            data_str = _extract_json(response_text)
+            if data_str:
+                data = json.loads(data_str)
+            else:
+                raise ValueError(f"Could not parse JSON from API response:\n{response_text[:500]}")
 
         elements_map = data.get("elements", {})
 
@@ -367,42 +395,57 @@ class VisionClient:
 
     def _parse_properties(self, raw: dict) -> ElementProperties:
         """Map a raw dict from Claude to an ElementProperties instance."""
+
+        def _f(val, default=0.0):
+            """Handle None values from JSON null."""
+            if val is None:
+                return default
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return default
+
+        def _s(val, default=""):
+            if val is None:
+                return default
+            return str(val)
+
         return ElementProperties(
-            element_type=str(raw.get("type", "unknown")),
-            background_hex=str(raw.get("background_hex", "#FFFFFF")),
-            foreground_hex=str(raw.get("foreground_hex", "#000000")),
-            accent_hex=str(raw.get("accent_hex", "#000000")),
-            opacity=float(raw.get("opacity", 1.0)),
-            font_family=str(raw.get("font_family", "unknown")),
-            font_size_sp=float(raw.get("font_size_sp", 0.0)),
-            font_weight=str(raw.get("font_weight", "normal")),
-            line_height=float(raw.get("line_height", 0.0)),
-            letter_spacing=float(raw.get("letter_spacing", 0.0)),
-            text_content=str(raw.get("text_content", "")),
-            padding_top=float(raw.get("padding_top", 0.0)),
-            padding_right=float(raw.get("padding_right", 0.0)),
-            padding_bottom=float(raw.get("padding_bottom", 0.0)),
-            padding_left=float(raw.get("padding_left", 0.0)),
-            margin_top=float(raw.get("margin_top", 0.0)),
-            margin_right=float(raw.get("margin_right", 0.0)),
-            margin_bottom=float(raw.get("margin_bottom", 0.0)),
-            margin_left=float(raw.get("margin_left", 0.0)),
-            border_radius_dp=float(raw.get("border_radius_dp", 0.0)),
-            border_width_dp=float(raw.get("border_width_dp", 0.0)),
-            border_color=str(raw.get("border_color", "#000000")),
-            box_shadow=str(raw.get("box_shadow", "")),
-            gradient=str(raw.get("gradient", "")),
-            blur_radius=float(raw.get("blur_radius", 0.0)),
-            contrast_ratio=float(raw.get("contrast_ratio", 0.0)),
-            wcag_level=str(raw.get("wcag_level", "")),
-            touch_target_dp=float(raw.get("touch_target_dp", 0.0)),
+            element_type=_s(raw.get("type"), "unknown"),
+            background_hex=_s(raw.get("background_hex"), "#FFFFFF"),
+            foreground_hex=_s(raw.get("foreground_hex"), "#000000"),
+            accent_hex=_s(raw.get("accent_hex"), "#000000"),
+            opacity=_f(raw.get("opacity"), 1.0),
+            font_family=_s(raw.get("font_family"), "unknown"),
+            font_size_sp=_f(raw.get("font_size_sp"), 0.0),
+            font_weight=_s(raw.get("font_weight"), "normal"),
+            line_height=_f(raw.get("line_height"), 0.0),
+            letter_spacing=_f(raw.get("letter_spacing"), 0.0),
+            text_content=_s(raw.get("text_content"), ""),
+            padding_top=_f(raw.get("padding_top"), 0.0),
+            padding_right=_f(raw.get("padding_right"), 0.0),
+            padding_bottom=_f(raw.get("padding_bottom"), 0.0),
+            padding_left=_f(raw.get("padding_left"), 0.0),
+            margin_top=_f(raw.get("margin_top"), 0.0),
+            margin_right=_f(raw.get("margin_right"), 0.0),
+            margin_bottom=_f(raw.get("margin_bottom"), 0.0),
+            margin_left=_f(raw.get("margin_left"), 0.0),
+            border_radius_dp=_f(raw.get("border_radius_dp"), 0.0),
+            border_width_dp=_f(raw.get("border_width_dp"), 0.0),
+            border_color=_s(raw.get("border_color"), "#000000"),
+            box_shadow=_s(raw.get("box_shadow"), ""),
+            gradient=_s(raw.get("gradient"), ""),
+            blur_radius=_f(raw.get("blur_radius"), 0.0),
+            contrast_ratio=_f(raw.get("contrast_ratio"), 0.0),
+            wcag_level=_s(raw.get("wcag_level"), ""),
+            touch_target_dp=_f(raw.get("touch_target_dp"), 0.0),
             screen_reader_support=bool(raw.get("screen_reader_support", False)),
-            shadow_direction=str(raw.get("shadow_direction", "")),
-            shadow_intensity=float(raw.get("shadow_intensity", 0.0)),
-            highlight_direction=str(raw.get("highlight_direction", "")),
-            specular_strength=float(raw.get("specular_strength", 0.0)),
-            anchor_x=str(raw.get("anchor_x", "")),
-            anchor_y=str(raw.get("anchor_y", "")),
+            shadow_direction=_s(raw.get("shadow_direction"), ""),
+            shadow_intensity=_f(raw.get("shadow_intensity"), 0.0),
+            highlight_direction=_s(raw.get("highlight_direction"), ""),
+            specular_strength=_f(raw.get("specular_strength"), 0.0),
+            anchor_x=_s(raw.get("anchor_x"), ""),
+            anchor_y=_s(raw.get("anchor_y"), ""),
         )
 
 
